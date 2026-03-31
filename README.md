@@ -97,7 +97,7 @@ Stage 5 — Downstream Task Heads
 
 ```bash
 # 1. Clone the repository
-git clone [https://github.com/ManvithMadhuvarsu/multimodal-autonomous-driving-ssl-pipeline].git
+git clone https://github.com/ManvithMadhuvarsu/multimodal-autonomous-driving-ssl-pipeline.git
 cd multimodal-ssl-ad
 
 # 2. Create and activate a virtual environment
