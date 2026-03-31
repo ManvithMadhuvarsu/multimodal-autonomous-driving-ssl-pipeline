@@ -6,7 +6,8 @@ using RGB, Thermal, LiDAR, and Radar sensor fusion.
 ## Pipeline Overview
 
 ```
-FLIR_ADAS + NuScenes + Other_Files
+FLIR_ADAS + NuScenes + Oth![Arch](https://github.com/user-attachments/assets/576d0897-7440-4f7d-a4b9-b8e311d87a0f)
+er_Files
           │
           ▼
   02_dataset_indexing.py      — Scan & build unified_dataset.json
