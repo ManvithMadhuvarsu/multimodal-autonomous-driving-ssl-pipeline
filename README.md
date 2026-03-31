@@ -10,11 +10,6 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![IEEE](https://img.shields.io/badge/IEEE-Open%20Journal%20of%20Computer%20Society-blue)](https://doi.org/10.1109/XXXX.2022.1234567)
 
-**Madhuvarsu Subhash Chandra Manvith¹ · K. Namitha² · Dhanush M³**
-
-¹²Amrita School of Computing, Amrita Vishwa Vidyapeetham, Amritapuri, Kerala, India  
-³University of Greenwich, London, United Kingdom
-
 <img width="2200" height="1100" alt="workflow" src="https://github.com/user-attachments/assets/f23a61f6-8659-45c7-8865-d4286aec0879" />
 
 </div>
@@ -95,9 +90,6 @@ Stage 5 — Downstream Task Heads
   Semantic Segmentation  :  DeepLabV3 head
   Trajectory Prediction  :  MLP head
 ```
-
-![Arch](https://github.com/user-attachments/assets/904f98d4-301e-4d31-864e-1cef3ad861b6)
-
 ---
 
 ## Installation
@@ -516,5 +508,3 @@ This work builds on the following open-source projects and datasets:
 - [BEVFusion](https://github.com/mit-han-lab/bevfusion) — Liu et al., ICRA 2023
 - [IS-Fusion](https://github.com/yinjunbo/IS-Fusion) — Yin et al., CVPR 2024
 - [Faster R-CNN](https://github.com/rbgirshick/py-faster-rcnn) — Ren et al., NeurIPS 2015
-
-![Arch](https://github.com/user-attachments/assets/34c2b22e-4b72-47be-97a4-095fe9239ff5)
