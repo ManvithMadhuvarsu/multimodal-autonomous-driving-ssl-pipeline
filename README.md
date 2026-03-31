@@ -45,7 +45,6 @@ Official implementation of our multimodal self-supervised learning (SSL) framewo
 - [Model Zoo](#model-zoo)
 - [Results](#results)
 - [Inference Server](#inference-server)
-- [Citation](#citation)
 - [Acknowledgements](#acknowledgements)
 
 ---
@@ -98,7 +97,7 @@ Stage 5 — Downstream Task Heads
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/<your-org>/multimodal-ssl-ad.git
+git clone [https://github.com/<your-org>/multimodal-ssl-ad](https://github.com/ManvithMadhuvarsu/multimodal-autonomous-driving-ssl-pipeline).git
 cd multimodal-ssl-ad
 
 # 2. Create and activate a virtual environment
@@ -479,21 +478,6 @@ multimodal-ssl-ad/
 | Experiment tracking | Weights & Biases |
 
 ---
-
-## Citation
-
-If you find this work useful in your research, please cite:
-
-```bibtex
-@article{manvith2025multimodal,
-  title   = {A Multimodal Self-Supervised Learning Framework for Scene Understanding
-             in Autonomous Driving Systems},
-  author  = {Manvith, Madhuvarsu Subhash Chandra and Namitha, K. and Dhanush, M.},
-  journal = {IEEE Open Journal of Computer Society},
-  year    = {2025},
-  doi     = {10.1109/XXXX.2022.1234567}
-}
-```
 
 ---
 
