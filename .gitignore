@@ -1,0 +1,23 @@
+# Python caches / env
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# JS dependencies
+drive-sim/node_modules/
+
+# Generated outputs
+output/
+*.log
+
+# Large media and archives
+*.mp4
+*.zip
+*.pptx
+*.pdf
+
+# OS/editor
+.DS_Store
+Thumbs.db
+
