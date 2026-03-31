@@ -4,8 +4,11 @@ End-to-end self-supervised learning pipeline for autonomous scene understanding
 using RGB, Thermal, LiDAR, and Radar sensor fusion.
 
 ## Pipeline Overview
+<img width="2200" height="1100" alt="workflow" src="https://github.com/user-attachments/assets/f23a61f6-8659-45c7-8865-d4286aec0879" />
+
 
 ```
+
 FLIR_ADAS + NuScenes + Oth![Arch](https://github.com/user-attachments/assets/576d0897-7440-4f7d-a4b9-b8e311d87a0f)
 er_Files
           │
@@ -30,7 +33,8 @@ er_Files
   08_rl_agent.py              — PPO RL agent + reward shaping (requires gym env)
           │
           ▼
-  09_inference_server.py      — FastAPI REST server for real-time inference
+  09_inference_server.py      — FastAPI REST server for real-time infere![Arch](https://github.com/user-attachments/assets/904f98d4-301e-4d31-864e-1cef3ad861b6)
+nce
 ```
 
 ## File Structure
@@ -83,6 +87,7 @@ on CUDA, with transparent CPU fallback.
 **Modular Architecture** — Models in `03_models.py` are entirely independent
 of training logic. Swap any component (e.g. replace PointNet with a sparse
 convolution network) without touching training code.
+![Arch](https://github.com/user-attachments/assets/34c2b22e-4b72-47be-97a4-095fe9239ff5)
 
 ## Outputs
 
@@ -98,3 +103,6 @@ convolution network) without touching training code.
 | `test_results.json` | Per-image {detection, segmentation, trajectory} outputs |
 | `aggregated_metrics.json` | Summary statistics for test results |
 | `test_results_hist.png` | Histogram of output norm distributions |
+
+![combined_6_modalities_no_model_text](https://github.com/user-attachments/assets/25acf4fa-868c-4c9e-a029-7771e37e26f9)
+
