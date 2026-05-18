@@ -380,6 +380,98 @@ class GNNEncoder(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 10b. Heterogeneous-Edge GNN  (drop-in replacement for GNNEncoder)
+#
+#  WHY: README defines three edge types (BEV proximity, Doppler similarity,
+#  learned relational), and embedding_and_fusion._build_edges_paper() already
+#  computes three separate scores per pair — then collapses them into a single
+#  scalar weight. GraphSAGE downstream cannot tell BEV-proximity from
+#  Doppler-similarity. HeteroEdgeGNN keeps per-edge-type parameters so type
+#  semantics survive message passing.
+#
+#  Also fixes the README's stated "GNN over-smoothing" limitation: PairNorm-
+#  style row centring + scaler inside each layer prevents embeddings from
+#  collapsing as depth grows.
+#
+#  Reference: HGT (Hu et al., WWW 2020, arXiv:2003.01332); GraphAD 2024
+#  (arXiv:2403.19098) reports +14%% planning collision improvement
+#  attributable to typed edges over GraphSAGE.
+# ═══════════════════════════════════════════════════════════════════════════
+class _TypedMP(nn.Module):
+    """Per-edge-type attention message passing."""
+    def __init__(self, in_dim: int, out_dim: int, edge_types):
+        super().__init__()
+        self.edge_types = tuple(edge_types)
+        self.W_src = nn.ModuleDict({et: nn.Linear(in_dim, out_dim, bias=False)
+                                    for et in self.edge_types})
+        self.W_dst = nn.ModuleDict({et: nn.Linear(in_dim, out_dim, bias=False)
+                                    for et in self.edge_types})
+        self.attn  = nn.ModuleDict({et: nn.Linear(2 * out_dim, 1)
+                                    for et in self.edge_types})
+
+    def _aggregate(self, x, edge_index, et: str):
+        N, _ = x.shape
+        out_dim = self.W_src[et].out_features
+        if edge_index is None or edge_index.numel() == 0:
+            return torch.zeros(N, out_dim, device=x.device, dtype=x.dtype)
+        src, dst = edge_index[0], edge_index[1]
+        h_src = self.W_src[et](x[src])
+        h_dst = self.W_dst[et](x[dst])
+        alpha = self.attn[et](torch.cat([h_dst, h_src], -1)).exp()
+        denom = torch.zeros(N, 1, device=x.device, dtype=x.dtype)
+        denom.scatter_add_(0, dst.unsqueeze(-1), alpha)
+        alpha = alpha / denom[dst].clamp(min=1e-8)
+        agg = torch.zeros(N, out_dim, device=x.device, dtype=x.dtype)
+        agg.scatter_add_(0, dst.unsqueeze(-1).expand(-1, out_dim), alpha * h_src)
+        return agg
+
+    def forward(self, x, edges_by_type):
+        agg_total = None
+        for et in self.edge_types:
+            ei = edges_by_type.get(et, torch.zeros((2, 0), dtype=torch.long, device=x.device))
+            agg = self._aggregate(x, ei, et)
+            agg_total = agg if agg_total is None else agg_total + agg
+        return agg_total / max(len(self.edge_types), 1)
+
+
+class HeteroEdgeGNN(nn.Module):
+    """
+    3-layer heterogeneous-edge GNN with PairNorm + skip; outputs graph-level
+    embedding (hid,). Forward signature: ``forward(x, edges_by_type)`` where
+    ``edges_by_type`` is a dict {edge_type_name: (2, E) tensor}.
+    """
+    def __init__(self,
+                 in_dim: int = 512,
+                 hid: int = 256,
+                 num_layers: int = 3,
+                 edge_types=("bev", "doppler", "relational"),
+                 dropout: float = 0.1):
+        super().__init__()
+        dims = [in_dim] + [hid] * num_layers
+        self.layers = nn.ModuleList([
+            _TypedMP(dims[i], dims[i + 1], edge_types) for i in range(num_layers)])
+        self.merges = nn.ModuleList([
+            nn.Linear(dims[i] + dims[i + 1], dims[i + 1]) for i in range(num_layers)])
+        self.norms  = nn.ModuleList([nn.LayerNorm(dims[i + 1]) for i in range(num_layers)])
+        self.skip   = nn.Linear(in_dim, hid)
+        self.drop   = nn.Dropout(dropout)
+        # PairNorm-style residual scaler — fights over-smoothing
+        self.pair_scale = nn.Parameter(torch.ones(num_layers))
+
+    def forward(self, x: torch.Tensor, edges_by_type: dict) -> torch.Tensor:
+        residual = self.skip(x)
+        x_in = x
+        for i, (mp, merge, norm) in enumerate(zip(self.layers, self.merges, self.norms)):
+            agg = mp(x_in, edges_by_type)
+            h   = F.gelu(norm(merge(torch.cat([x_in, agg], dim=-1))))
+            # PairNorm: row-centre then rescale
+            h   = h - h.mean(0, keepdim=True)
+            h   = self.pair_scale[i] * h / (h.norm(dim=-1, keepdim=True).mean().clamp(min=1e-6))
+            x_in = self.drop(h)
+        return (x_in + residual).mean(dim=0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 11.  Task Heads
 #      in_dim = 256 (GNN output size after [FIX-4])
 # ═══════════════════════════════════════════════════════════════════════════

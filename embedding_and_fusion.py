@@ -142,50 +142,81 @@ def _doppler_similarity(vi: np.ndarray, vj: np.ndarray,
 def _build_edges_paper(nodes: dict,
                        scorer: _RelationalScorer) -> list:
     """
-    [FIX-1]  Paper-compliant three-criterion edge construction.
+    Backward-compatible edge builder: returns the flat
+    [[src_name, dst_name, weight], ...] list previously written into
+    scene_graphs.json. Internally delegates to ``build_typed_edges`` and
+    collapses per-type scores to ``max`` to preserve historical behaviour.
+    """
+    typed = build_typed_edges(nodes, scorer)
+    out: list = []
+    seen: dict = {}
+    for et, lst in typed.items():
+        for src_i, dst_i, w in lst:
+            key = (src_i, dst_i)
+            seen[key] = max(seen.get(key, 0.0), float(w))
+    node_names = list(nodes.keys())
+    for (i, j), w in seen.items():
+        out.append([node_names[i], node_names[j], float(w)])
+    return out
 
-    For every ordered pair (i, j) of distinct nodes, add a directed edge
-    if ANY of the following holds:
-        (a) BEV proximity:   cos_sim(v_i, v_j)  ≥  1 - BEV_PROXIMITY_DELTA
-        (b) Doppler sim:     doppler_sim(v_i, v_j) ≥  DOPPLER_SIM_THRESH
-            (only when at least one node is "radar")
-        (c) Learned score:   σ(W_r · [v_i ‖ v_j]) ≥  RELATIONAL_THRESH
 
-    The stored edge weight is the max of all three criterion scores.
+def build_typed_edges(nodes: dict,
+                      scorer: _RelationalScorer) -> dict:
+    """
+    Heterogeneous-edge construction. For every ordered pair of distinct nodes
+    we evaluate the three paper criteria and place the edge under the
+    *category* that fired it, instead of collapsing to a single weight.
 
-    Returns list of [node_i, node_j, weight] — one entry per directed edge.
+        {
+          "bev":        [[src_idx, dst_idx, weight], ...],
+          "doppler":    [[src_idx, dst_idx, weight], ...],
+          "relational": [[src_idx, dst_idx, weight], ...],
+        }
+
+    Indices match the iteration order of ``nodes.keys()``. This is the format
+    that ``models.HeteroEdgeGNN`` consumes (after conversion to (2, E) tensors
+    via ``typed_edges_to_tensor``).
     """
     node_names = list(nodes.keys())
-    edges      = []
+    out = {"bev": [], "doppler": [], "relational": []}
 
     for i in range(len(node_names)):
         for j in range(len(node_names)):
             if i == j:
                 continue
             ni, nj = node_names[i], node_names[j]
-            vi_np  = np.array(nodes[ni], dtype=np.float64)
-            vj_np  = np.array(nodes[nj], dtype=np.float64)
+            vi_np = np.array(nodes[ni], dtype=np.float64)
+            vj_np = np.array(nodes[nj], dtype=np.float64)
 
-            # ── Criterion (a): BEV proximity ──────────────────────────────
             bev_sim = _bev_proximity_score(vi_np, vj_np)
-            crit_a  = bev_sim >= (1.0 - BEV_PROXIMITY_DELTA)
+            if bev_sim >= (1.0 - BEV_PROXIMITY_DELTA):
+                out["bev"].append([i, j, float(bev_sim)])
 
-            # ── Criterion (b): Doppler similarity ─────────────────────────
             dop_sim = _doppler_similarity(vi_np, vj_np, ni, nj)
-            crit_b  = dop_sim >= DOPPLER_SIM_THRESH
+            if dop_sim >= DOPPLER_SIM_THRESH:
+                out["doppler"].append([i, j, float(dop_sim)])
 
-            # ── Criterion (c): Learned relational score ───────────────────
-            vi_t    = torch.tensor(nodes[ni], dtype=torch.float32)
-            vj_t    = torch.tensor(nodes[nj], dtype=torch.float32)
+            vi_t = torch.tensor(nodes[ni], dtype=torch.float32)
+            vj_t = torch.tensor(nodes[nj], dtype=torch.float32)
             with torch.no_grad():
                 rel_score = scorer(vi_t, vj_t)
-            crit_c  = rel_score >= RELATIONAL_THRESH
+            if rel_score >= RELATIONAL_THRESH:
+                out["relational"].append([i, j, float(rel_score)])
 
-            if crit_a or crit_b or crit_c:
-                weight = max(bev_sim, dop_sim, rel_score)
-                edges.append([ni, nj, float(weight)])
+    return out
 
-    return edges
+
+def typed_edges_to_tensor(typed: dict,
+                          device: torch.device = None) -> dict:
+    """Convert the JSON-friendly typed-edge dict to {type: (2, E) tensor}."""
+    res = {}
+    for et, lst in typed.items():
+        if not lst:
+            res[et] = torch.zeros((2, 0), dtype=torch.long, device=device or "cpu")
+            continue
+        arr = np.asarray(lst, dtype=np.int64)[:, :2].T
+        res[et] = torch.as_tensor(arr, dtype=torch.long, device=device or "cpu")
+    return res
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -484,9 +515,15 @@ def build_scene_graphs() -> None:
             continue
 
         # ── Build edges via paper's three-criterion method  [FIX-1] ────────
-        edges = _build_edges_paper(nodes, scorer)
+        # We now store BOTH formats:
+        #   "edges"          — backward-compatible flat list (legacy GraphSAGE)
+        #   "edges_by_type"  — typed dict consumed by HeteroEdgeGNN (Tier-B2)
+        edges        = _build_edges_paper(nodes, scorer)
+        typed_edges  = build_typed_edges(nodes, scorer)
 
-        sg_map[k] = {"nodes": nodes, "edges": edges}
+        sg_map[k] = {"nodes": nodes,
+                     "edges": edges,
+                     "edges_by_type": typed_edges}
 
         if (i + 1) % 200 == 0:
             write_json(SCENE_GRAPH_OUT, sg_map)
