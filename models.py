@@ -426,6 +426,234 @@ class TrajectoryHead(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 11b. DETR-style 3D Detection Head  +  Hungarian Set Loss
+#
+# Replaces the MLP DetectionHead above for nuScenes-leaderboard-compatible
+# bounding-box outputs. Emits per-learned-query (cls, 7-DoF box, velocity) so
+# predictions can flow directly into the nuScenes devkit DetectionEval (and
+# remove the hash() pseudo-label that perception_heads_and_export.py used to
+# require). The set loss uses Hungarian matching (scipy.optimize.linear_sum_
+# assignment).
+#
+# Reference: DETR (Carion et al., ECCV 2020) adapted for 3D AD; design
+# motivated by IS-Fusion / SparseFusion CVPR/ICCV 2023-24 results.
+# ═══════════════════════════════════════════════════════════════════════════
+import math as _math
+
+
+class _QueryPosEmbed(nn.Module):
+    def __init__(self, num_queries: int, dim: int):
+        super().__init__()
+        self.pos = nn.Parameter(torch.randn(num_queries, dim) * 0.02)
+
+    def forward(self) -> torch.Tensor:
+        return self.pos                                          # (K, D)
+
+
+class _DETRDecoderLayer(nn.Module):
+    """Pre-LN decoder block: self-attn(queries) + cross-attn(queries -> memory) + FFN."""
+    def __init__(self, dim: int, heads: int, ff_mult: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.self_attn  = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.norm3 = nn.LayerNorm(dim)
+        self.ff = nn.Sequential(
+            nn.Linear(dim, dim * ff_mult), nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * ff_mult, dim),
+        )
+
+    def forward(self, q: torch.Tensor, memory: torch.Tensor,
+                key_padding_mask: torch.Tensor = None) -> torch.Tensor:
+        q = q + self.self_attn(self.norm1(q), self.norm1(q), self.norm1(q), need_weights=False)[0]
+        q = q + self.cross_attn(self.norm2(q), memory, memory,
+                                key_padding_mask=key_padding_mask, need_weights=False)[0]
+        q = q + self.ff(self.norm3(q))
+        return q
+
+
+class DETR3DHead(nn.Module):
+    """
+    DETR-style 3D detection head producing nuScenes-format box predictions.
+
+    Inputs
+    ------
+        memory : (B, T, emb_dim)   scene-graph node features (T variable)
+        key_padding_mask : optional (B, T) True-where-padded mask
+
+    Outputs (dict)
+    --------------
+        cls_logits : (B, K, num_classes+1)   includes "no-object" class
+        box_3d     : (B, K, 7)               (cx, cy, cz, w, l, h, yaw)
+        velocity   : (B, K, 2)               (vx, vy)
+        queries    : (B, K, emb_dim)         useful for aux losses
+    """
+    NUSCENES_CLASS_NAMES = (
+        "car", "truck", "bus", "trailer", "construction_vehicle",
+        "pedestrian", "motorcycle", "bicycle", "traffic_cone", "barrier",
+    )
+
+    def __init__(self,
+                 emb_dim: int = 512,
+                 num_classes: int = 10,
+                 num_queries: int = 300,
+                 depth: int = 3,
+                 heads: int = 8,
+                 dropout: float = 0.1):
+        super().__init__()
+        self.num_classes = num_classes
+        self.num_queries = num_queries
+        self.emb_dim     = emb_dim
+
+        self.queries = nn.Parameter(torch.randn(num_queries, emb_dim) * 0.02)
+        self.q_pos   = _QueryPosEmbed(num_queries, emb_dim)
+        self.layers  = nn.ModuleList(
+            [_DETRDecoderLayer(emb_dim, heads, dropout=dropout) for _ in range(depth)])
+
+        self.cls_head   = nn.Linear(emb_dim, num_classes + 1)    # +1 = no-object
+        self.box_head   = nn.Sequential(
+            nn.Linear(emb_dim, emb_dim), nn.GELU(),
+            nn.Linear(emb_dim, 7),                                # cx,cy,cz,w,l,h,yaw-raw
+        )
+        self.yaw_sincos = nn.Linear(emb_dim, 2)
+        self.vel_head   = nn.Linear(emb_dim, 2)
+
+        # Initialise size means near nuScenes averages
+        with torch.no_grad():
+            self.box_head[-1].bias[3:6] = torch.log(torch.tensor([1.95, 4.62, 1.73]))
+
+    # ----------------------------------------------------------------------
+    def forward(self, memory: torch.Tensor,
+                key_padding_mask: torch.Tensor = None) -> dict:
+        B = memory.size(0)
+        q = self.queries.unsqueeze(0).expand(B, -1, -1) + self.q_pos().unsqueeze(0)
+        for layer in self.layers:
+            q = layer(q, memory, key_padding_mask=key_padding_mask)
+
+        cls = self.cls_head(q)                                   # (B, K, C+1)
+
+        raw = self.box_head(q)
+        cx, cy, cz = raw[..., 0], raw[..., 1], raw[..., 2]
+        w  = raw[..., 3].exp()
+        l  = raw[..., 4].exp()
+        h  = raw[..., 5].exp()
+        yaw_sc = self.yaw_sincos(q)
+        yaw = torch.atan2(yaw_sc[..., 0], yaw_sc[..., 1])
+
+        box = torch.stack([cx, cy, cz, w, l, h, yaw], dim=-1)    # (B, K, 7)
+        vel = self.vel_head(q)                                   # (B, K, 2)
+
+        return {"cls_logits": cls, "box_3d": box, "velocity": vel, "queries": q}
+
+    # ----------------------------------------------------------------------
+    @torch.no_grad()
+    def predict_nuscenes_format(self,
+                                memory: torch.Tensor,
+                                sample_token: str,
+                                score_thresh: float = 0.05) -> list:
+        """
+        Return a list of dicts in the official nuScenes detection submission
+        format. Pass these into the dict[sample_token -> list] that
+        DetectionEval expects.
+        """
+        out = self.forward(memory)
+        probs = out["cls_logits"].softmax(-1)[..., :-1]           # drop no-object
+        scores, labels = probs.max(-1)
+        boxes = out["box_3d"]; vels = out["velocity"]
+        results = []
+        for b in range(memory.size(0)):
+            for k in range(self.num_queries):
+                s = float(scores[b, k])
+                if s < score_thresh: continue
+                cx, cy, cz, w, l, h, yaw = [float(x) for x in boxes[b, k].tolist()]
+                vx, vy = [float(x) for x in vels[b, k].tolist()]
+                results.append({
+                    "sample_token":    sample_token,
+                    "translation":     [cx, cy, cz],
+                    "size":            [w, l, h],
+                    "rotation":        [_math.cos(yaw / 2), 0.0, 0.0, _math.sin(yaw / 2)],
+                    "velocity":        [vx, vy],
+                    "detection_name":  self.NUSCENES_CLASS_NAMES[int(labels[b, k])],
+                    "detection_score": s,
+                    "attribute_name":  "",
+                })
+        return results
+
+
+class DETRSetMatchLoss(nn.Module):
+    """
+    Hungarian-matching set loss for DETR3DHead.
+
+    targets per-sample format:
+        {"labels":   LongTensor(N,),
+         "boxes":    FloatTensor(N, 7),
+         "velocity": FloatTensor(N, 2)}
+    """
+    def __init__(self, num_classes: int = 10, weights: dict = None):
+        super().__init__()
+        try:
+            from scipy.optimize import linear_sum_assignment
+        except ImportError as e:
+            raise ImportError(
+                "DETRSetMatchLoss requires scipy. Add `scipy>=1.10` to requirements.txt.") from e
+        self._lsa = linear_sum_assignment
+        self.num_classes = num_classes
+        self.weights = {"cls": 1.0, "box": 5.0, "vel": 0.5} if weights is None else weights
+
+    def _match_one(self, pred_cls, pred_box, gt_labels, gt_boxes):
+        K = pred_cls.size(0); N = gt_labels.size(0)
+        if N == 0:
+            empty = torch.empty(0, dtype=torch.long, device=pred_cls.device)
+            return empty, empty
+        prob = pred_cls.softmax(-1)
+        cost_cls = -prob[:, gt_labels]
+        cost_box = torch.cdist(pred_box[:, :3], gt_boxes[:, :3], p=1)
+        C = self.weights["cls"] * cost_cls + self.weights["box"] * cost_box
+        Cnp = C.detach().cpu().numpy()
+        row, col = self._lsa(Cnp)
+        return (torch.as_tensor(row, dtype=torch.long, device=pred_cls.device),
+                torch.as_tensor(col, dtype=torch.long, device=pred_cls.device))
+
+    def forward(self, outputs: dict, targets: list) -> dict:
+        B = outputs["cls_logits"].size(0)
+        total_cls = total_box = total_vel = 0.0
+        num_box = 0
+        for b in range(B):
+            row, col = self._match_one(outputs["cls_logits"][b], outputs["box_3d"][b],
+                                       targets[b]["labels"], targets[b]["boxes"])
+            cls_target = torch.full((outputs["cls_logits"].size(1),),
+                                    self.num_classes, dtype=torch.long,
+                                    device=outputs["cls_logits"].device)
+            if row.numel():
+                cls_target[row] = targets[b]["labels"][col]
+            total_cls = total_cls + F.cross_entropy(outputs["cls_logits"][b], cls_target,
+                                                    reduction="mean")
+            if row.numel():
+                pb = outputs["box_3d"][b, row]
+                gb = targets[b]["boxes"][col]
+                box_l = F.smooth_l1_loss(pb[:, :3], gb[:, :3]) + \
+                        F.smooth_l1_loss(pb[:, 3:6].log(), gb[:, 3:6].log()) + \
+                        F.smooth_l1_loss(torch.stack([pb[:, 6].sin(), pb[:, 6].cos()], -1),
+                                         torch.stack([gb[:, 6].sin(), gb[:, 6].cos()], -1))
+                pv = outputs["velocity"][b, row]
+                gv = targets[b]["velocity"][col]
+                vel_l = F.smooth_l1_loss(pv, gv)
+                total_box = total_box + box_l
+                total_vel = total_vel + vel_l
+                num_box += 1
+        denom = max(num_box, 1)
+        return {"loss":     self.weights["cls"] * (total_cls / B)
+                          + self.weights["box"] * (total_box / denom)
+                          + self.weights["vel"] * (total_vel / denom),
+                "cls_loss": total_cls / B,
+                "box_loss": total_box / denom,
+                "vel_loss": total_vel / denom,
+                "matched":  num_box}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 12.  Full End-to-End Model
 # ═══════════════════════════════════════════════════════════════════════════
 class FullADModel(nn.Module):
