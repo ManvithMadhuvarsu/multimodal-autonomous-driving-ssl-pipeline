@@ -278,6 +278,136 @@ class MultiModalFusionTransformer(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 9b. Depth-Weighted Sensor-Adaptive Fusion Transformer
+#
+# Drop-in replacement for MultiModalFusionTransformer that adds depth-bucket
+# conditioning. SAMFusion (Bijelic et al., ECCV 2024, arXiv:2508.16408) showed
+# the single biggest adverse-weather gain comes from weighting modalities by
+# depth: RGB near, LiDAR/Radar far, Thermal in low light. Their Table 2
+# reports +17.2 AP for long-range pedestrians in fog purely from this scheme.
+#
+# How it differs from MultiModalFusionTransformer:
+#   1. A small _DepthModulator MLP consumes raw depth statistics
+#      (min / p25 / p50 / p75 metres) and produces per-modality weights.
+#   2. The weights enter every encoder layer as an additive log-bias inside
+#      attention softmax, so suppressed modalities lose attention mass.
+#   3. depth_stats is OPTIONAL — falls back to a learned default token so
+#      existing call sites (no LiDAR at inference) still work.
+#
+# Use compute_depth_stats(lidar_xyz) to build the depth_stats tensor when
+# LiDAR is available.
+# ═══════════════════════════════════════════════════════════════════════════
+def compute_depth_stats(lidar_xyz: torch.Tensor) -> torch.Tensor:
+    """
+    Per-frame depth summary. Input (B, N, 3) → output (B, 4) =
+    [min, p25, p50, p75] of point distance from origin (metres).
+    """
+    dist = torch.norm(lidar_xyz, dim=-1)
+    n = max(1, dist.size(-1))
+    return torch.stack([
+        dist.min(dim=-1).values,
+        dist.kthvalue(max(1, int(0.25 * n)), dim=-1).values,
+        dist.median(dim=-1).values,
+        dist.kthvalue(max(1, int(0.75 * n)), dim=-1).values,
+    ], dim=-1)
+
+
+class _DepthModulator(nn.Module):
+    """Depth statistics (B, n_stats) → (B, num_buckets, num_modalities) weights."""
+    def __init__(self, n_stats: int = 4, num_buckets: int = 3, num_modalities: int = 4):
+        super().__init__()
+        self.num_buckets = num_buckets
+        self.num_modalities = num_modalities
+        self.mlp = nn.Sequential(
+            nn.Linear(n_stats, 64), nn.GELU(),
+            nn.Linear(64,  num_buckets * num_modalities),
+        )
+        self.default_stats = nn.Parameter(torch.tensor([[1.0, 10.0, 25.0, 60.0]]))
+
+    def forward(self, depth_stats, batch: int) -> torch.Tensor:
+        if depth_stats is None:
+            depth_stats = self.default_stats.expand(batch, -1)
+        elif depth_stats.size(0) != batch:
+            depth_stats = depth_stats[:1].expand(batch, -1)
+        logits = self.mlp(depth_stats).view(batch, self.num_buckets, self.num_modalities)
+        return logits.softmax(-1)                                   # (B, K, M)
+
+
+class _DepthWeightedLayer(nn.Module):
+    """Pre-LN encoder block with depth-bucket attention bias."""
+    def __init__(self, dim: int, heads: int, ff_mult: int = 4,
+                 num_buckets: int = 3, dropout: float = 0.1):
+        super().__init__()
+        self.attn  = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ff = nn.Sequential(
+            nn.Linear(dim, dim * ff_mult), nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * ff_mult, dim),
+        )
+        self.tau = nn.Parameter(torch.tensor(1.0))                  # learnable bias scale
+
+    def forward(self, x, token_modality, bucket_weights):
+        mod_gain = bucket_weights.mean(dim=1)                       # (B, M)
+        per_token = mod_gain[:, token_modality]                     # (B, T)
+        bias = self.tau * per_token.log().unsqueeze(1)              # (B, 1, T)
+        h = self.norm1(x)
+        attn_bias = bias.expand(-1, x.size(1), -1)
+        attn_out, _ = self.attn(h, h, h,
+                                attn_mask=attn_bias.repeat_interleave(
+                                    self.attn.num_heads, dim=0),
+                                need_weights=False)
+        x = x + attn_out
+        x = x + self.ff(self.norm2(x))
+        return x
+
+
+class DepthWeightedFusionTransformer(nn.Module):
+    """Drop-in replacement for MultiModalFusionTransformer with depth conditioning."""
+    _MOD_IDX = {"rgb": 0, "thermal": 1, "lidar": 2, "radar": 3}
+
+    def __init__(self,
+                 emb_dim: int = 512,
+                 depth: int = 6,
+                 heads: int = 8,
+                 dropout: float = 0.1,
+                 num_buckets: int = 3):
+        super().__init__()
+        self.rgb_proj   = _ModalProj(emb_dim)
+        self.th_proj    = _ModalProj(emb_dim)
+        self.lidar_proj = _ModalProj(emb_dim)
+        self.radar_proj = _ModalProj(emb_dim)
+        self.modulator  = _DepthModulator(n_stats=4, num_buckets=num_buckets, num_modalities=4)
+        self.layers = nn.ModuleList([
+            _DepthWeightedLayer(emb_dim, heads, num_buckets=num_buckets, dropout=dropout)
+            for _ in range(depth)])
+        self.norm = nn.LayerNorm(emb_dim)
+        self.out  = nn.Sequential(
+            nn.Linear(emb_dim, emb_dim), nn.GELU(),
+            nn.LayerNorm(emb_dim),
+            nn.Linear(emb_dim, emb_dim),
+        )
+
+    def forward(self, rgb=None, th=None, lidar=None, radar=None,
+                depth_stats: torch.Tensor = None) -> torch.Tensor:
+        tokens, mods = [], []
+        if rgb   is not None: tokens.append(self.rgb_proj(rgb));    mods.append(self._MOD_IDX["rgb"])
+        if th    is not None: tokens.append(self.th_proj(th));      mods.append(self._MOD_IDX["thermal"])
+        if lidar is not None: tokens.append(self.lidar_proj(lidar));mods.append(self._MOD_IDX["lidar"])
+        if radar is not None: tokens.append(self.radar_proj(radar));mods.append(self._MOD_IDX["radar"])
+        if not tokens:
+            raise ValueError("DepthWeightedFusionTransformer: at least one modality required.")
+        x = torch.cat(tokens, dim=1)
+        token_modality = torch.tensor(mods, dtype=torch.long, device=x.device)
+        bucket_weights = self.modulator(depth_stats, batch=x.size(0))
+        for layer in self.layers:
+            x = layer(x, token_modality, bucket_weights)
+        x = self.norm(x).mean(dim=1)
+        return self.out(x)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 10.  GNN Encoder  —  3-layer GraphSAGE, hidden=256  [FIX-4]
 #
 #  Paper §Training Parameters: "three-layer GraphSAGE, hidden dim=256"
