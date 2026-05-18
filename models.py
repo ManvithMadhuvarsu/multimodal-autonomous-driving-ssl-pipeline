@@ -892,8 +892,37 @@ class FullADModel(nn.Module):
         "segmentation" (16,)    segmentation class logits
         "trajectory"   (10,)    5×2 waypoints
     """
-    def __init__(self):
+    def __init__(self,
+                 use_depth_fusion: bool = True,
+                 use_hetero_gnn:   bool = True,
+                 use_detr_head:    bool = True,
+                 num_detr_queries: int  = 300):
+        """
+        Args:
+            use_depth_fusion : if True use DepthWeightedFusionTransformer (Tier-B4)
+                               instead of MultiModalFusionTransformer
+            use_hetero_gnn   : if True use HeteroEdgeGNN (Tier-B2)
+                               instead of GNNEncoder (homogeneous GraphSAGE)
+            use_detr_head    : if True use DETR3DHead (Tier-B1) — emits per-query
+                               (cls, 7-DoF box, velocity) in nuScenes format
+                               instead of the legacy MLP DetectionHead
+            num_detr_queries : K for the DETR head (default 300, matches DETR)
+        Flags can also be set via env vars:
+            MM_USE_DEPTH_FUSION, MM_USE_HETERO_GNN, MM_USE_DETR_HEAD
+            (set to "0" or "false" to disable).
+        """
         super().__init__()
+        import os as _os
+
+        def _envflag(name, default):
+            v = _os.environ.get(name)
+            if v is None: return default
+            return v.lower() not in ("0", "false", "no", "off")
+
+        use_depth_fusion = _envflag("MM_USE_DEPTH_FUSION", use_depth_fusion)
+        use_hetero_gnn   = _envflag("MM_USE_HETERO_GNN",   use_hetero_gnn)
+        use_detr_head    = _envflag("MM_USE_DETR_HEAD",    use_detr_head)
+
         # Encoders
         self.rgb_enc   = RGBEncoder(512)
         self.th_enc    = ThermalEncoder(512)
@@ -904,24 +933,79 @@ class FullADModel(nn.Module):
         self.th_proj    = projection_head(512, 512)
         self.lidar_proj = projection_head(512, 512)
         self.radar_proj = projection_head(512, 512)
-        # Fusion + graph
-        self.fusion = MultiModalFusionTransformer(512, depth=6, heads=8)   # [FIX-3]
-        self.gnn    = GNNEncoder(in_dim=512, hid=256, num_layers=3)        # [FIX-4]
-        # Task heads (in_dim=256 = GNN hid)
-        self.det  = DetectionHead(in_dim=256, num_classes=10)
+
+        # Fusion: depth-weighted (Tier-B4) by default, with legacy fallback.
+        if use_depth_fusion:
+            self.fusion = DepthWeightedFusionTransformer(emb_dim=512, depth=6, heads=8)
+        else:
+            self.fusion = MultiModalFusionTransformer(512, depth=6, heads=8)
+
+        # GNN: heterogeneous-edge (Tier-B2) by default, with legacy fallback.
+        if use_hetero_gnn:
+            self.gnn = HeteroEdgeGNN(in_dim=512, hid=256, num_layers=3,
+                                     edge_types=("bev", "doppler", "relational"))
+        else:
+            self.gnn = GNNEncoder(in_dim=512, hid=256, num_layers=3)
+
+        # Detection: DETR-style (Tier-B1) by default; legacy MLP available for ablations.
+        self.use_detr_head = use_detr_head
+        if use_detr_head:
+            self.det = DETR3DHead(emb_dim=512, num_classes=10,
+                                  num_queries=num_detr_queries, depth=3)
+        else:
+            self.det = DetectionHead(in_dim=256, num_classes=10)
+
+        # Segmentation + trajectory heads keep the MLP form (downstream loss
+        # is per-frame for the current data wiring; future-frame segmentation
+        # is a separate research direction).
         self.seg  = SegmentationHead(in_dim=256, num_classes=16)
         self.traj = TrajectoryHead(in_dim=256, n_wp=5, coords=2)
 
-    def forward(self, rgb=None, thermal=None, lidar=None, radar=None) -> dict:
+        # Stable edge_index for the 5-node graph (legacy GraphSAGE path).
+        self._fc_edge_index = torch.tensor(
+            [[0, 0, 0, 0, 1, 1, 1, 2, 2, 3, 3, 4],
+             [1, 2, 3, 4, 0, 2, 3, 0, 1, 0, 2, 0]], dtype=torch.long)
+        # Pre-built edges_by_type for the 5-node graph (hetero path).
+        # By default every edge is in "bev" (BEV-proximity is the most generic
+        # similarity). At runtime, embedding_and_fusion fills the real typed
+        # edges via build_typed_edges; this fallback is just for direct
+        # FullADModel(forward) calls without going through the pipeline.
+        self._fc_edges_by_type = {
+            "bev":        self._fc_edge_index,
+            "doppler":    torch.zeros(2, 0, dtype=torch.long),
+            "relational": torch.zeros(2, 0, dtype=torch.long),
+        }
+
+    def forward(self,
+                rgb=None, thermal=None, lidar=None, radar=None,
+                depth_stats=None,
+                edges_by_type: dict = None,
+                ) -> dict:
+        """
+        Args:
+            depth_stats : optional (B, 4) tensor — used by DepthWeightedFusion.
+                          If None, the modulator's learned default is used.
+            edges_by_type : optional override of the 5-node typed edges. If
+                          None, falls back to the pre-built fully-connected
+                          "bev" graph (legacy behaviour).
+        """
         dev = next(self.parameters()).device
-        Z   = lambda: torch.zeros(1, 512, device=dev)       # zero placeholder
+        Z   = lambda: torch.zeros(1, 512, device=dev)
 
         re  = self.rgb_proj(self.rgb_enc(rgb))           if rgb     is not None else None
         te  = self.th_proj(self.th_enc(thermal))         if thermal is not None else None
         le  = self.lidar_proj(self.lidar_enc(lidar))     if lidar   is not None else None
         rde = self.radar_proj(self.radar_enc(radar))     if radar   is not None else None
 
-        fused = self.fusion(re, te, le, rde)               # (B, 512)
+        # Auto-compute depth stats from LiDAR when available and not provided.
+        if depth_stats is None and lidar is not None and isinstance(self.fusion,
+                                                                     DepthWeightedFusionTransformer):
+            depth_stats = compute_depth_stats(lidar)
+
+        if isinstance(self.fusion, DepthWeightedFusionTransformer):
+            fused = self.fusion(re, te, le, rde, depth_stats=depth_stats)
+        else:
+            fused = self.fusion(re, te, le, rde)
 
         # 5-node scene graph: [fused | rgb | thermal | lidar | radar]
         nodes = torch.stack([
@@ -931,21 +1015,34 @@ class FullADModel(nn.Module):
             le.squeeze(0)  if le  is not None else Z().squeeze(0),
             rde.squeeze(0) if rde is not None else Z().squeeze(0),
         ])                                                   # (5, 512)
-        # Fully-connected directed edge index for 5 nodes
-        ei = torch.tensor(
-            [[0, 0, 0, 0, 1, 1, 1, 2, 2, 3, 3, 4],
-             [1, 2, 3, 4, 0, 2, 3, 0, 1, 0, 2, 0]],
-            dtype=torch.long, device=dev)
-        gnn_out = self.gnn(nodes, ei)                        # (256,)
-        inp     = gnn_out.unsqueeze(0)                       # (1, 256)
 
-        return {
+        # GNN pass
+        if isinstance(self.gnn, HeteroEdgeGNN):
+            ebt = edges_by_type
+            if ebt is None:
+                ebt = {k: v.to(dev) for k, v in self._fc_edges_by_type.items()}
+            gnn_out = self.gnn(nodes, ebt)
+        else:
+            gnn_out = self.gnn(nodes, self._fc_edge_index.to(dev))
+
+        inp = gnn_out.unsqueeze(0)                           # (1, 256)
+
+        out = {
             "fused":        fused.squeeze(0),                # (512,)
             "gnn":          gnn_out,                         # (256,)
-            "detection":    self.det(inp).squeeze(0),        # (10,)
             "segmentation": self.seg(inp).squeeze(0),        # (16,)
             "trajectory":   self.traj(inp).squeeze(0),       # (10,)
         }
+
+        # Detection head: shape depends on which variant is active.
+        if self.use_detr_head:
+            memory = nodes.unsqueeze(0)                      # (1, 5, 512)
+            det_out = self.det(memory=memory)
+            out["detection"] = det_out                       # full dict (cls/box/vel/queries)
+        else:
+            out["detection"] = self.det(inp).squeeze(0)      # (10,) legacy logits
+
+        return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════
