@@ -31,13 +31,18 @@ from models import (
     RGBEncoder, ThermalEncoder, LiDAREncoder, RadarEncoder,
     projection_head, GNNEncoder,
     DetectionHead, SegmentationHead, TrajectoryHead,
-    MultiModalFusionTransformer, FullADModel, build_fusion_model
+    MultiModalFusionTransformer, FullADModel, build_fusion_model,
+    DETR3DHead, DETRSetMatchLoss,
 )
 from ssl_training import (
     IMG_SIZE, N_POINTS, img_transform, thermal_transform,
     CheckpointManager, load_rgb_safe, load_thermal_safe,
     load_pointcloud_safe, SSL_DIR
 )
+import nuscenes_gt as nusc_gt
+
+# nuScenes devkit version used for GT lookups
+NUSC_VERSION = "v1.0-trainval"
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 FUSED_PATH         = OUTPUT_ROOT / "fused_embeddings.json"
@@ -119,9 +124,35 @@ def train_perception_heads(num_epochs: int = 3):
     keys       = list(fused_data.keys())
     total      = len(keys)
 
-    det  = DetectionHead(512, N_DET_CLASSES).to(DEVICE)
+    # ── Decide detection mode (DETR head vs legacy MLP) ─────────────────────
+    # We honour the same env var that FullADModel honours, so the head module
+    # in this stage stays consistent with what the full model expects.
+    import os as _os
+    USE_DETR = _os.environ.get("MM_USE_DETR_HEAD", "1").lower() not in ("0", "false", "no", "off")
+
+    if USE_DETR:
+        det      = DETR3DHead(emb_dim=512, num_classes=N_DET_CLASSES,
+                              num_queries=300, depth=3).to(DEVICE)
+        det_loss = DETRSetMatchLoss(num_classes=N_DET_CLASSES).to(DEVICE)
+        logger.info("Detection head: DETR3DHead (Tier-B1) with Hungarian set loss.")
+    else:
+        det      = DetectionHead(512, N_DET_CLASSES).to(DEVICE)
+        det_loss = nn.CrossEntropyLoss()
+        logger.info("Detection head: legacy MLP DetectionHead (set MM_USE_DETR_HEAD=1 to switch).")
+
     seg  = SegmentationHead(512, N_SEG_CLASSES).to(DEVICE)
     traj = TrajectoryHead(512, n_wp=5, coords=2).to(DEVICE)
+
+    # ── Pre-flight: is real nuScenes GT available? ──────────────────────────
+    gt_available = nusc_gt.is_available()
+    if not gt_available:
+        logger.warning(
+            "nuscenes-devkit not installed — detection & trajectory losses "
+            "will be SKIPPED (no fake labels). pip install nuscenes-devkit to "
+            "unlock real-GT supervision.")
+    else:
+        logger.info(f"nuScenes-devkit detected. GT lookups will use "
+                    f"NUS_ROOT={NUS_ROOT} version={NUSC_VERSION}.")
 
     opt_d = torch.optim.AdamW(det.parameters(),  lr=3e-4, weight_decay=1e-4)
     opt_s = torch.optim.AdamW(seg.parameters(),  lr=3e-4, weight_decay=1e-4)
@@ -155,10 +186,18 @@ def train_perception_heads(num_epochs: int = 3):
 
     logger.info(f"Training heads: {num_epochs} epochs, {total} samples")
 
+    # Epoch-level GT availability counters (helps diagnose "why did det loss
+    # never decrease?" — usually because tokens couldn't be resolved).
+    epoch_stats = {"det_with_gt": 0, "det_skipped": 0,
+                   "traj_with_gt": 0, "traj_skipped": 0,
+                   "seg_with_gt": 0, "seg_skipped": 0}
+
     for ep in range(start_epoch, num_epochs):
         det.train(); seg.train(); traj.train()
         rd, rs, rt = 0.0, 0.0, 0.0
         cd, cs, ct = 0, 0, 0
+        # reset per-epoch
+        for kstat in epoch_stats: epoch_stats[kstat] = 0
 
         pbar = tqdm(range(total), desc=f"Heads {ep+1}/{num_epochs}")
 
@@ -172,27 +211,82 @@ def train_perception_heads(num_epochs: int = 3):
 
             x = torch.tensor(fv, dtype=torch.float32).to(DEVICE).unsqueeze(0)  # (1,512)
 
-            # ── Detection: pseudo label from embedding hash ──
-            out_d    = det(x)
-            pseudo_d = torch.tensor([abs(hash(k)) % N_DET_CLASSES],
-                                    dtype=torch.long, device=DEVICE)
-            loss_d   = ce(out_d, pseudo_d)
+            # ── Resolve nuScenes sample_token (best-effort) ──────────────────
+            # 1) entry may carry "token" / "sample_token" directly
+            # 2) entry may carry a file path → extract sample_data token,
+            #    then ask devkit for the parent sample_token.
+            token = fd.get("sample_token") or fd.get("token")
+            if not (isinstance(token, str) and len(token) == 32):
+                token = None
+            if token is None and gt_available:
+                path = fd.get("path") or fd.get("rgb_path") or fd.get("lidar_path")
+                if path:
+                    sd_tok = nusc_gt.derive_token_from_path(str(path))
+                    if sd_tok:
+                        token = nusc_gt.sample_token_for_sample_data(
+                            sd_tok, NUSC_VERSION, str(NUS_ROOT))
 
-            # ── Segmentation: panoptic label when available ──
+            losses = []
+
+            # ── Detection: real GT or skip ────────────────────────────────
+            det_targets = None
+            if token is not None and gt_available:
+                det_targets = nusc_gt.load_detection_targets(
+                    token, NUSC_VERSION, str(NUS_ROOT))
+
+            if det_targets is not None:
+                if USE_DETR:
+                    # DETR head: memory is the 1-token fused vector (single
+                    # column of cross-attention memory). Future revision can
+                    # feed the full 5-node memory from scene_graphs.json.
+                    memory = x.unsqueeze(1)                              # (1, 1, 512)
+                    det_out = det(memory)
+                    tgts = [{k_: v_.to(DEVICE) for k_, v_ in det_targets.items()}]
+                    ldict = det_loss(det_out, tgts)
+                    loss_d = ldict["loss"]
+                else:
+                    # Legacy MLP head: train against the majority GT class
+                    # (frame-level classification — same as the previous
+                    # pseudo-label slot, but now using a REAL label).
+                    out_d = det(x)
+                    majority_cls = det_targets["labels"].mode().values.unsqueeze(0).to(DEVICE)
+                    loss_d = ce(out_d, majority_cls)
+                losses.append(loss_d)
+                rd += float(loss_d); cd += 1
+                epoch_stats["det_with_gt"] += 1
+            else:
+                epoch_stats["det_skipped"] += 1
+
+            # ── Segmentation: panoptic GT when available ──
             out_s  = seg(x)
-            token  = fd.get("token", k)
-            lbl_s  = _panoptic_label(str(token)) if isinstance(token, str) and len(str(token)) >= 8 else None
+            lbl_s  = _panoptic_label(token) if token is not None else None
             if lbl_s is not None:
                 loss_s = ce(out_s, lbl_s.to(DEVICE).unsqueeze(0))
+                losses.append(loss_s)
+                rs += float(loss_s); cs += 1
+                epoch_stats["seg_with_gt"] += 1
             else:
-                loss_s = (out_s ** 2).mean() * 0.01   # soft regulariser
+                epoch_stats["seg_skipped"] += 1
 
-            # ── Trajectory: L2 regulariser (CAN bus not wired up yet) ──
-            out_t  = traj(x)
-            loss_t = (out_t ** 2).mean() * 0.01
+            # ── Trajectory: real ego-pose future, no L2-to-zero ──────────
+            out_t  = traj(x)                                            # (1, 10)
+            traj_gt = None
+            if token is not None and gt_available:
+                traj_gt = nusc_gt.load_trajectory_target(
+                    token, NUSC_VERSION, str(NUS_ROOT),
+                    n_waypoints=5, dt=0.5)
+            if traj_gt is not None:
+                loss_t = ((out_t.view(1, 5, 2) - traj_gt.to(DEVICE).unsqueeze(0)) ** 2).mean()
+                losses.append(loss_t)
+                rt += float(loss_t); ct += 1
+                epoch_stats["traj_with_gt"] += 1
+            else:
+                epoch_stats["traj_skipped"] += 1
 
-            loss = loss_d + loss_s + loss_t
+            if not losses:
+                continue                                            # nothing supervised this step
 
+            loss = sum(losses)
             opt_d.zero_grad(set_to_none=True)
             opt_s.zero_grad(set_to_none=True)
             opt_t.zero_grad(set_to_none=True)
@@ -203,13 +297,10 @@ def train_perception_heads(num_epochs: int = 3):
 
             opt_d.step(); opt_s.step(); opt_t.step()
 
-            rd += loss_d.item(); cd += 1
-            rs += loss_s.item(); cs += 1
-            rt += loss_t.item(); ct += 1
-
-            pbar.set_postfix({"det": f"{rd/cd:.4f}",
-                               "seg": f"{rs/cs:.4f}",
-                               "traj":f"{rt/ct:.4f}"})
+            pbar.set_postfix({"det":  f"{(rd/max(cd,1)):.4f}",
+                               "seg":  f"{(rs/max(cs,1)):.4f}",
+                               "traj": f"{(rt/max(ct,1)):.4f}",
+                               "det_gt": f"{cd}/{cd + epoch_stats['det_skipped']}"})
 
             if (bi+1) % 500 == 0:
                 # FIXED: model= parameter now included
@@ -229,8 +320,19 @@ def train_perception_heads(num_epochs: int = 3):
         save_ckpt(TRAJ_LATEST, model=traj, optim=opt_t,  epoch=ep)
 
         write_json(PH_PROG, {"epoch": ep+1, "batch": 0})
-        logger.info(f"Heads ep {ep+1} | det {rd/max(cd,1):.4f} "
-                    f"seg {rs/max(cs,1):.4f} traj {rt/max(ct,1):.4f}")
+        logger.info(
+            f"Heads ep {ep+1} | det {rd/max(cd,1):.4f} (gt={epoch_stats['det_with_gt']} "
+            f"skipped={epoch_stats['det_skipped']}) | "
+            f"seg {rs/max(cs,1):.4f} (gt={epoch_stats['seg_with_gt']} "
+            f"skipped={epoch_stats['seg_skipped']}) | "
+            f"traj {rt/max(ct,1):.4f} (gt={epoch_stats['traj_with_gt']} "
+            f"skipped={epoch_stats['traj_skipped']})")
+        if epoch_stats["det_skipped"] > 10 * max(epoch_stats["det_with_gt"], 1):
+            logger.warning(
+                "Detection GT was skipped >90%% of samples this epoch. "
+                "Most likely the fused_embeddings.json entries do not carry "
+                "sample_token. Add `token` to extract_fused_embeddings() to "
+                "unlock real-GT supervision.")
         start_batch = 0
 
     PH_FLAG.touch()

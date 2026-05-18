@@ -10,6 +10,7 @@ FIXES vs original:
 =============================================================================
 """
 
+import os
 import torch
 import numpy as np
 from pathlib import Path
@@ -21,7 +22,7 @@ from setup import (
     OUTPUT_ROOT, PROGRESS_ROOT, GNN_DIR, DEVICE, logger,
     read_json, write_json, save_ckpt, load_ckpt, find_latest
 )
-from models import GNNEncoder
+from models import GNNEncoder, HeteroEdgeGNN
 
 SCENE_GRAPH_PATH = OUTPUT_ROOT / "scene_graphs.json"
 GNN_EMB_OUT      = OUTPUT_ROOT / "gnn_embeddings.json"
@@ -33,12 +34,33 @@ GNN_EVAL_FLAG    = PROGRESS_ROOT / "gnn_eval_complete.flag"
 # All possible node names (5 including radar)
 ALL_NODES = ["fused", "rgb", "thermal", "lidar", "radar"]
 
+# Heterogeneous-edge GNN gate. Set env var GNN_TYPE=hetero to use
+# HeteroEdgeGNN (Tier-B2); default "sage" keeps the original GraphSAGE for
+# backward compatibility with existing checkpoints.
+GNN_TYPE = os.environ.get("GNN_TYPE", "sage").lower()
+EDGE_TYPES = ("bev", "doppler", "relational")
+
 
 def _prep_graph(entry: dict, device):
+    """
+    Returns:
+      (node_tensor, edges_payload)
+
+    For sage  → edges_payload is a (2, E) long tensor (homogeneous edge_index).
+    For hetero → edges_payload is a dict[edge_type] -> (2, E) long tensor.
+
+    Graceful fallback: if the scene-graph JSON only contains the legacy
+    ``edges`` list, hetero mode treats every edge as "bev" so training still
+    runs (with reduced type signal).
+    """
     nodes_dict = entry.get("nodes", {})
     names      = [n for n in ALL_NODES if n in nodes_dict]
 
     if not names:
+        if GNN_TYPE == "hetero":
+            empty = {et: torch.zeros(2, 0, dtype=torch.long, device=device)
+                     for et in EDGE_TYPES}
+            return torch.zeros(1, 512, dtype=torch.float32, device=device), empty
         return (torch.zeros(1, 512, dtype=torch.float32, device=device),
                 torch.zeros(2, 0, dtype=torch.long, device=device))
 
@@ -51,7 +73,40 @@ def _prep_graph(entry: dict, device):
         )
     node_tensor = torch.tensor(np.stack(feats), dtype=torch.float32, device=device)
 
-    # Build fully-connected undirected edge index
+    if GNN_TYPE == "hetero":
+        # New format: edges_by_type with integer indices.
+        ebt = entry.get("edges_by_type")
+        typed = {et: torch.zeros(2, 0, dtype=torch.long, device=device) for et in EDGE_TYPES}
+        if isinstance(ebt, dict):
+            for et in EDGE_TYPES:
+                pairs = []
+                for e in ebt.get(et, []):
+                    if len(e) >= 2:
+                        # indices in ebt refer to the original nodes dict order;
+                        # remap into our filtered `names` list.
+                        original_names = list(nodes_dict.keys())
+                        try:
+                            ui = names.index(original_names[int(e[0])])
+                            vi = names.index(original_names[int(e[1])])
+                            pairs.append([ui, vi])
+                        except (ValueError, IndexError):
+                            continue
+                if pairs:
+                    typed[et] = torch.tensor(pairs, dtype=torch.long, device=device).T
+        else:
+            # Legacy scene_graphs.json — collapse everything onto "bev" edges
+            edges = entry.get("edges", [])
+            pairs = []
+            for edge in edges:
+                if len(edge) >= 2:
+                    u, v = edge[0], edge[1]
+                    if u in names and v in names:
+                        pairs.append([names.index(u), names.index(v)])
+            if pairs:
+                typed["bev"] = torch.tensor(pairs, dtype=torch.long, device=device).T
+        return node_tensor, typed
+
+    # ── Legacy SAGE path: build fully-connected undirected edge index ──
     edges = entry.get("edges", [])
     pairs = []
     for edge in edges:
@@ -68,6 +123,16 @@ def _prep_graph(entry: dict, device):
     return node_tensor, edge_idx
 
 
+def _build_gnn():
+    """Return a fresh GNN module honouring the GNN_TYPE env var."""
+    if GNN_TYPE == "hetero":
+        logger.info("GNN: HeteroEdgeGNN (Tier-B2; edge_types=%s)" % (EDGE_TYPES,))
+        return HeteroEdgeGNN(in_dim=512, hid=256, num_layers=3,
+                             edge_types=EDGE_TYPES).to(DEVICE)
+    logger.info("GNN: GraphSAGE (default; set GNN_TYPE=hetero to switch)")
+    return GNNEncoder(in_dim=512, hid=512).to(DEVICE)
+
+
 def train_gnn(num_epochs: int = 5):
     if GNN_TRAIN_FLAG.exists():
         logger.info("GNN training already done.")
@@ -80,7 +145,7 @@ def train_gnn(num_epochs: int = 5):
     keys    = list(sg_data.keys())
     total   = len(keys)
 
-    gnn = GNNEncoder(in_dim=512, hid=512).to(DEVICE)
+    gnn = _build_gnn()
     opt = torch.optim.AdamW(gnn.parameters(), lr=1e-4, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=num_epochs)
 
@@ -152,7 +217,7 @@ def eval_gnn():
     keys    = list(sg_data.keys())
     total   = len(keys)
 
-    gnn = GNNEncoder(in_dim=512, hid=512).to(DEVICE)
+    gnn = _build_gnn()
     opt = torch.optim.AdamW(gnn.parameters(), lr=1e-4)
     latest = find_latest(GNN_DIR, "gnn")
     if latest:

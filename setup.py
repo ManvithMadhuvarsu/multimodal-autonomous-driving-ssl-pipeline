@@ -81,11 +81,18 @@ def get_device():
     except ImportError:
         return "cpu"
 
-set_seed(42)
+# Honour MULTIMODAL_SSL_SEED for reproducible multi-seed sweeps. The
+# evaluators/run_multi_seed.py orchestrator sets this env var before
+# launching each child process, so the same set of training scripts can
+# be driven through seeds [42, 123, 7] for the ± std table reviewers
+# expect at IEEE Transactions venues.
+_DEFAULT_SEED = int(os.environ.get("MULTIMODAL_SSL_SEED", "42"))
+set_seed(_DEFAULT_SEED)
 DEVICE = get_device()
 logger.info(f"Data root  : {DATA_ROOT}")
 logger.info(f"Output root: {OUTPUT_ROOT}")
 logger.info(f"Device     : {DEVICE}")
+logger.info(f"Random seed: {_DEFAULT_SEED}  (override via MULTIMODAL_SSL_SEED)")
 
 # ── 4. JSON helpers ────────────────────────────────────────────────────────
 def read_json(path: Path) -> Any:
