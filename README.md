@@ -423,17 +423,37 @@ curl -X POST http://localhost:8000/predict \
 
 ```
 multimodal-ssl-ad/
-├── 01_setup.py                          # Paths, seeds, device, logging, checkpoint helpers
-├── 02_dataset_indexing.py               # Dataset scan → unified_dataset.json
-├── 03_models.py                         # All architectures (encoders, transformer, GNN, heads)
-├── 04_ssl_training.py                   # Per-modality SSL pretraining
-├── 05_embedding_and_fusion.py           # Embedding extraction, fusion training, scene graphs
-├── 06_gnn_training.py                   # GraphSAGE training + evaluation
-├── 07_perception_heads_and_export.py    # Task heads, model assembly, TorchScript export
-├── 08_rl_agent.py                       # PPO trainer, reward shaping, rollout buffer
-├── 09_inference_server.py               # FastAPI inference server
-├── eval.py                              # Evaluation and benchmarking
-├── run_pipeline.py                      # Master orchestrator
+├── setup.py                          # Paths, seeds (honours MULTIMODAL_SSL_SEED), loaders
+├── dataset_indexing.py               # Dataset scan → unified_dataset.json
+├── models.py                         # Encoders, fusion, GNN, heads — now includes:
+│                                       DETR3DHead + DETRSetMatchLoss       (Tier-B1)
+│                                       HeteroEdgeGNN + PairNorm            (Tier-B2)
+│                                       DepthWeightedFusionTransformer      (Tier-B4)
+├── ssl_training.py                   # Per-modality SSL pretraining (NT-Xent + BYOL)
+├── embedding_and_fusion.py           # Embedding extraction, fusion training, scene graphs;
+│                                       now writes typed edges_by_type (Tier-B2)
+├── world_model_pretext.py            # NEW — 4D forward-dynamics pretext   (Tier-B3)
+├── gnn_training.py                   # GraphSAGE + HeteroEdgeGNN (GNN_TYPE env var)
+├── perception_heads_and_export.py    # Task heads + assembly + export.
+│                                       DETR Hungarian loss against real nuScenes GT;
+│                                       no more hash() pseudo-labels.
+├── nuscenes_gt.py                    # NEW — real-GT loaders (devkit optional)
+├── quantize_int8.py                  # NEW — INT8 quantization CLI         (Tier-B5)
+├── rl_agent.py                       # PPO trainer, reward shaping, rollout buffer
+├── inference_pipeline.py             # FastAPI inference server
+├── run_pipeline.py                   # Master orchestrator — 15 stages total
+├── evaluators/                       # NEW — Tier-A evaluators (devkit required)
+│   ├── eval_planning_uniad.py          # UniAD-protocol L2 + collision %
+│   ├── eval_adverse_weather.py         # SeeingThroughFog cond × range × class AP
+│   ├── eval_nuscenes_official.py       # Devkit NDS / per-class / mATE-mASE-mAOE-mAVE-mAAE
+│   └── run_multi_seed.py               # Multi-seed orchestrator + mean ± std table
+├── research_comparison/              # NEW — 2026 SOTA comparison + analysis
+│   ├── COMPARISON.md                   # 19-method sourced table
+│   ├── IMPROVEMENTS.md                 # Ranked Tier-A / B / C plan
+│   ├── RUNBOOK.md                      # Post-merge runbook
+│   ├── data.py + generate_gifs.py      # 7 animated comparison artifacts
+│   ├── smoke_test.py                   # Integrated-pipeline sanity check
+│   └── gifs/                           # The animated artifacts
 ├── requirements.txt
 └── README.md
 ```

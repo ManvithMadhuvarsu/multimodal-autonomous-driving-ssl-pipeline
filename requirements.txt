@@ -29,3 +29,14 @@ fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
 python-multipart>=0.0.9
 pydantic>=2.0.0
+
+# ── Optional ────────────────────────────────────────────────
+# Real-GT supervision (perception_heads_and_export.py +
+# evaluators/eval_planning_uniad.py + evaluators/eval_nuscenes_official.py).
+# Without it the pipeline still runs, but detection / trajectory losses are
+# skipped (no fake labels) and the planning / official-detection evaluators
+# refuse to run. Install when you have the nuScenes dataset on disk.
+#
+#   pip install nuscenes-devkit
+#
+# Pinned at 1.1.* on PyPI as of mid-2026.
